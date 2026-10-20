@@ -1,6 +1,9 @@
 # pdfmerger
 Combine PDF figures horizontally or vertically with custom labels.
 installation: pip3 install --user git+https://github.com/Soheil-Arbabi/pdfmerger.git
+
+
+
 Usage Example:
 pdfmerger figure1.pdf figure2.pdf h "a(0.05,0.90)" "b(0.05,0.90)" combined.pdf
 
