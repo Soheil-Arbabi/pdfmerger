@@ -8,6 +8,94 @@ from pathlib import Path
 import pymupdf
 
 
+def detect_plot_area(page, layout):
+    """Find closed, axis-aligned vector frames; fail instead of guessing.
+
+    Stacked frames may share x bounds in vertical layouts, and side-by-side
+    frames may share y bounds in horizontal layouts. Returned coordinates
+    use the visible page coordinate system.
+    """
+    horizontal, vertical = [], []
+    tolerance = 0.75  # PDF points
+    min_w = max(30, page.rect.width * 0.20)
+    min_h = max(30, page.rect.height * 0.12)
+
+    def edge(a, b):
+        a = a * page.rotation_matrix
+        b = b * page.rotation_matrix
+        if abs(a.y - b.y) <= tolerance and abs(a.x - b.x) >= min_w:
+            horizontal.append((min(a.x, b.x), max(a.x, b.x), (a.y+b.y)/2))
+        if abs(a.x - b.x) <= tolerance and abs(a.y - b.y) >= min_h:
+            vertical.append(((a.x+b.x)/2, min(a.y, b.y), max(a.y, b.y)))
+
+    for drawing in page.get_drawings():
+        if drawing.get('color') is None or drawing.get('stroke_opacity', 1) == 0:
+            continue
+        for item in drawing['items']:
+            if item[0] == 'l':
+                edge(item[1], item[2])
+            elif item[0] == 're':
+                r = item[1]
+                for a, b in [(r.tl, r.tr), (r.tr, r.br),
+                             (r.br, r.bl), (r.bl, r.tl)]:
+                    edge(a, b)
+
+    frames = []
+    for i, (left, right, y1) in enumerate(horizontal):
+        for l2, r2, y2 in horizontal[i+1:]:
+            if abs(left-l2) > tolerance or abs(right-r2) > tolerance:
+                continue
+            top, bottom = sorted((y1, y2))
+            if bottom-top < min_h:
+                continue
+            def has_side(x):
+                return any(abs(vx-x) <= tolerance and abs(vt-top) <= tolerance
+                           and abs(vb-bottom) <= tolerance
+                           for vx, vt, vb in vertical)
+            if has_side(left) and has_side(right):
+                r = pymupdf.Rect(left, top, right, bottom)
+                if not any(max(abs(a-b) for a, b in zip(r, old)) <= tolerance
+                           for old in frames):
+                    frames.append(r)
+
+    # Inner grid rectangles and inset axes should not replace the main frame.
+    frames = [r for r in frames if not any(
+        other.contains(r) and other.get_area() > r.get_area() * 1.01
+        for other in frames)]
+    if not frames:
+        raise ValueError('No closed vector plot frame detected. '
+                         'Use PDFs with four visible axes spines, or omit '
+                         '--align-plot-areas (scanned plots are unsupported).')
+    axis = (0, 2) if layout == 'v' else (1, 3)
+    if any(abs(r[k]-frames[0][k]) > tolerance
+           for r in frames for k in axis):
+        raise ValueError('Multiple plot frames have different alignment bounds. '
+                         'Split the page into individual plots or omit '
+                         '--align-plot-areas.')
+    return frames[0]
+
+
+def panel_rectangles(pages, layout, gap, margin, align):
+    """Uniformly scale full pages, preserving every margin and annotation."""
+    areas = [detect_plot_area(p, layout) for p in pages] if align else None
+    scales = [1.0] * len(pages)
+    offsets = [0.0] * len(pages)
+    if align:
+        spans = [r.width if layout == 'v' else r.height for r in areas]
+        scales = [spans[0]/span for span in spans]
+        starts = [(r.x0 if layout == 'v' else r.y0)*s
+                  for r, s in zip(areas, scales)]
+        offsets = [max(starts)-start for start in starts]
+    rectangles = []
+    cursor = margin
+    for page, scale, offset in zip(pages, scales, offsets):
+        w, h = page.rect.width*scale, page.rect.height*scale
+        x, y = (margin+offset, cursor) if layout == 'v' else (cursor, margin+offset)
+        rectangles.append(pymupdf.Rect(x, y, x+w, y+h))
+        cursor += (h if layout == 'v' else w) + gap
+    return rectangles
+
+
 def parse_label(value):
     """Read 'Any text(x,y)'; '-' means no label."""
     if value == "-":
@@ -18,7 +106,7 @@ def parse_label(value):
     )
     if not match:
         raise ValueError(
-            f"Invalid label: {value!r}. Use 'a(10,20)' or '-'."
+            f"Invalid label: {value!r}. Use 'a(0.1,0.9)' or '-'."
         )
 
     text, x, y = match.groups()
@@ -95,29 +183,22 @@ def merge(args):
                 raise ValueError(f"{source} has no page {args.page}.")
             pages.append(document[args.page - 1])
 
-        widths = [page.rect.width for page in pages]
-        heights = [page.rect.height for page in pages]
-
-        if layout == "h":
-            width = sum(widths) + args.gap * (len(pages) - 1)
-            height = max(heights)
-        else:
-            width = max(widths)
-            height = sum(heights) + args.gap * (len(pages) - 1)
+        rectangles = panel_rectangles(pages, layout, args.gap, args.margin,
+                                      args.align_plot_areas)
 
         result = stack.enter_context(pymupdf.open())
         canvas = result.new_page(
-            width=width + 2 * args.margin,
-            height=height + 2 * args.margin,
+            width=max(r.x1 for r in rectangles) + args.margin,
+            height=max(r.y1 for r in rectangles) + args.margin,
         )
 
         x = y = args.margin
         placements = []
 
         # Place all panels first so later panels cannot cover labels.
-        for document, page, label in zip(documents, pages, labels):
-            w, h = page.rect.width, page.rect.height
-            rectangle = pymupdf.Rect(x, y, x + w, y + h)
+        for document, page, label, rectangle in zip(documents, pages, labels, rectangles):
+            x, y = rectangle.x0, rectangle.y0
+            w, h = rectangle.width, rectangle.height
 
             # Blank PDF pages need no embedded content.
             if page.get_contents():
@@ -159,13 +240,9 @@ def merge(args):
             else:
                 y += h + args.gap
 
-                # Embed a separate font for labels to avoid imported font conflicts.
-        label_font = pymupdf.Font("hebo")
-        canvas.insert_font(
-            fontname="PanelLabelBold",
-            fontbuffer=label_font.buffer,
-        )
-
+        if placements:
+            canvas.insert_font(fontname="PanelLabelBold",
+                               fontbuffer=pymupdf.Font("hebo").buffer)
         for text, x, y in placements:
             canvas.insert_text(
                 (x, y),
@@ -187,6 +264,10 @@ def main():
         usage='%(prog)s PDF PDF [...] h|v ["label(x,y)" ...] OUTPUT [options]',
     )
     parser.add_argument("items", nargs="+")
+    parser.add_argument("--align-plot-areas", action="store_true",
+                        help="Align closed vector plot frames: equal widths and left/right "
+                             "edges for v; equal heights and top/bottom edges for h. "
+                             "Uses the first PDF's plot size; preserves full pages.")
     parser.add_argument("--gap", type=float, default=10,
                         help="Space between panels in points (default: 10)")
     parser.add_argument("--margin", type=float, default=0,
