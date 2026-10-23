@@ -1,3 +1,4 @@
+<img width="1774" height="887" alt="PDF panel merging made simple" src="https://github.com/user-attachments/assets/a63ba399-c6af-49f1-a43d-b7c69447fc53" />
 # PDF Merger
 
 A small Python tool I made to combine PDF figures horizontally or vertically and add panel labels. I use it to prepare figures for papers (especially on overleaf), and I hope it is useful for others too.
